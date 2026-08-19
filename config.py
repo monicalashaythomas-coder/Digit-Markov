@@ -12,12 +12,12 @@ from typing import List
 # ---------------------------------------------------------------------------
 # Connection
 # ---------------------------------------------------------------------------
-DERIV_APP_ID = os.environ.get("DERIV_APP_ID", "1089")
-DERIV_API_TOKEN = os.environ.get("DERIV_API_TOKEN", "")  # REQUIRED for live trading
+DERIV_APP_ID = os.environ.get("DERIV_APP_ID", "33yLH5BDgaA4vcRK3qwY6")
+DERIV_API_TOKEN = os.environ.get("DERIV_API_TOKEN", "pat_dd504873355fa2fa3b84ea9765daa345944464973b330cc6d34dac25e162458a")  # REQUIRED for live trading
 DERIV_WS_URL = f"wss://ws.derivws.com/websockets/v3?app_id={DERIV_APP_ID}"
 
-SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
-SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "https://ybxbbfunyddvuwibgbse.supabase.co")
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InlieGJiZnVueWRkdnV3aWJnYnNlIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc3OTY3MTc0NSwiZXhwIjoyMDk1MjQ3NzQ1fQ.Ubur1jpVYgyzf69NpwDHbTV4ukx_u4YPLUNF1ZHlwzY")
 
 # ---------------------------------------------------------------------------
 # Symbols
