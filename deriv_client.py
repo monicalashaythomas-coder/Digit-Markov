@@ -6,6 +6,17 @@ symbol), payout proposals (for real-time EV pricing), buying digit
 contracts, and tracking contract settlement for risk_manager feedback.
 
 Reference: https://api.deriv.com/ (api.deriv.com / developers.deriv.com)
+
+Uses the `websockets` library's NEW asyncio implementation explicitly
+(websockets.asyncio.client), not the legacy one. The legacy implementation
+(what plain `import websockets; websockets.connect(...)` used to mean) was
+deprecated in websockets 14.0 and is scheduled for removal by 2030; the
+top-level `websockets.connect` alias itself already points at the new
+implementation as of 14.0, but this file previously typed against
+`websockets.WebSocketClientProtocol`, which belongs to the legacy module
+and only still exists as a deprecated compatibility alias. Importing the
+new implementation explicitly removes that ambiguity and the deprecation
+warning it throws on every import.
 """
 import asyncio
 import itertools
@@ -13,7 +24,8 @@ import json
 import logging
 from typing import Awaitable, Callable, Dict, Optional
 
-import websockets
+from websockets.asyncio.client import connect as ws_connect, ClientConnection
+from websockets.exceptions import ConnectionClosed
 
 import config
 
@@ -27,7 +39,7 @@ class DerivClient:
     def __init__(self, api_token: str = config.DERIV_API_TOKEN, ws_url: str = config.DERIV_WS_URL):
         self.api_token = api_token
         self.ws_url = ws_url
-        self.ws: Optional[websockets.WebSocketClientProtocol] = None
+        self.ws: Optional[ClientConnection] = None
         self._req_id_counter = itertools.count(1)
         self._pending: Dict[int, asyncio.Future] = {}
         self._pip_size: Dict[str, int] = {}
@@ -40,7 +52,7 @@ class DerivClient:
     # Connection lifecycle
     # ------------------------------------------------------------------
     async def connect(self):
-        self.ws = await websockets.connect(self.ws_url, ping_interval=20, ping_timeout=10)
+        self.ws = await ws_connect(self.ws_url, ping_interval=20, ping_timeout=10)
         self._listener_task = asyncio.create_task(self._listen())
         if self.api_token:
             await self.authorize()
@@ -61,7 +73,7 @@ class DerivClient:
                 await self._dispatch(msg)
         except asyncio.CancelledError:
             pass
-        except websockets.ConnectionClosed:
+        except ConnectionClosed:
             log.error("Deriv websocket connection closed unexpectedly.")
 
     async def _dispatch(self, msg: dict):
@@ -98,7 +110,7 @@ class DerivClient:
     async def _send(self, payload: dict, timeout: float = 15.0) -> dict:
         req_id = next(self._req_id_counter)
         payload = {**payload, "req_id": req_id}
-        fut: asyncio.Future = asyncio.get_event_loop().create_future()
+        fut: asyncio.Future = asyncio.get_running_loop().create_future()
         self._pending[req_id] = fut
         await self.ws.send(json.dumps(payload))
         try:
