@@ -118,8 +118,18 @@ API" — see https://developers.deriv.com/docs/options/websocket/):
 2. `POST /trading/v1/options/accounts/{id}/otp` (Bearer token) → a
    short-lived (120s), single-use WebSocket URL with an OTP embedded.
 3. Connect to that URL directly — no `authorize` message needed. Everything
-   else (`ticks`, `proposal`, `buy`, `proposal_open_contract`, ...) is the
-   same message protocol as before.
+   else (`ticks`, `proposal`, `buy`, `proposal_open_contract`, ...) still
+   uses the same JSON-RPC-style message protocol as before, but **not the
+   same schema per message** — some fields were renamed/removed and unknown
+   properties are now rejected outright instead of ignored. In particular:
+   `proposal`'s `symbol` field is now `underlying_symbol`, and
+   `active_symbols`' `product_type`/`landing_company_short` params were
+   removed (response `symbol`/`pip` also became
+   `underlying_symbol`/`pip_size`). Sending the old names doesn't crash the
+   process — it just makes that one Deriv call fail silently with
+   `InputValidationFailed`, so it can run for a long time before anyone
+   notices no proposals are ever coming back. Full diffs per endpoint:
+   https://developers.deriv.com/comparison/
 
 `deriv_client.py`'s `connect()` tries this flow first, and falls back to the
 old direct-connect flow only if the account-lookup step 404s (meaning this

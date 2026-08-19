@@ -19,8 +19,20 @@ Deriv has migrated accounts off the old "connect directly, then send an
           already embedded as a query param.
     3. Connect to that URL directly. No `authorize` message needed — the OTP
        in the URL is the authentication. Everything else (ticks, proposal,
-       buy, proposal_open_contract, ...) is the same JSON-RPC-style message
-       protocol as before.
+       buy, proposal_open_contract, ...) is still the same JSON-RPC-style
+       message protocol as before, BUT NOT the same *schema* per message —
+       several message types dropped/renamed fields and now reject unknown
+       properties (`additionalProperties: false`). Notably:
+         - `proposal` (and anything shaped like it): `symbol` was renamed to
+           `underlying_symbol`.
+         - `active_symbols`: `product_type` (and `landing_company_short`,
+           `landing_company`, `loginid`) were removed outright; response
+           `symbol`/`pip` became `underlying_symbol`/`pip_size`.
+       Sending the old field names doesn't get ignored — Deriv 400s with
+       `InputValidationFailed: Properties not allowed: <field>`, which is
+       silent/non-fatal per-message (the bot just never gets a valid
+       proposal back), so it's easy to miss in a crash-free deploy log.
+       Full request/response diffs: https://developers.deriv.com/comparison/
 
     See: https://developers.deriv.com/docs/options/websocket/
 
@@ -298,13 +310,18 @@ class DerivClient:
     async def get_active_symbol_pip_size(self, symbol: str) -> int:
         if symbol in self._pip_size:
             return self._pip_size[symbol]
-        resp = await self._send({"active_symbols": "brief", "product_type": "basic"})
+        # Options API (new): active_symbols no longer accepts `product_type`
+        # (additionalProperties: false — it 400s with "Properties not
+        # allowed: product_type"). Response field names also changed:
+        # `symbol` -> `underlying_symbol`, `pip` -> `pip_size`.
+        # See https://developers.deriv.com/comparison/active-symbols/
+        resp = await self._send({"active_symbols": "brief"})
         for s in resp.get("active_symbols", []):
-            pip = s.get("pip")
+            pip = s.get("pip_size")
             if pip is not None:
                 # pip like "0.001" -> 3 decimal places
                 decimals = len(str(pip).split(".")[-1]) if "." in str(pip) else 0
-                self._pip_size[s["symbol"]] = decimals
+                self._pip_size[s["underlying_symbol"]] = decimals
         return self._pip_size.get(symbol, 4)
 
     async def subscribe_ticks(self, symbol: str, on_tick: TICK_HANDLER):
@@ -331,7 +348,10 @@ class DerivClient:
             "currency": "USD",
             "duration": duration_ticks,
             "duration_unit": "t",
-            "symbol": symbol,
+            # Options API (new) renamed `symbol` -> `underlying_symbol`;
+            # the old key 400s with "Properties not allowed: symbol".
+            # See https://developers.deriv.com/comparison/proposal/
+            "underlying_symbol": symbol,
         }
         if barrier is not None:
             payload["barrier"] = str(barrier)
@@ -358,7 +378,9 @@ class DerivClient:
             "currency": "USD",
             "duration": duration_ticks,
             "duration_unit": "t",
-            "symbol": symbol,
+            # Options API (new) renamed `symbol` -> `underlying_symbol`.
+            # See https://developers.deriv.com/comparison/proposal/
+            "underlying_symbol": symbol,
         }
         if barrier is not None:
             payload["barrier"] = str(barrier)
