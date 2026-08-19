@@ -12,12 +12,34 @@ from typing import List
 # ---------------------------------------------------------------------------
 # Connection
 # ---------------------------------------------------------------------------
-DERIV_APP_ID = os.environ.get("DERIV_APP_ID", "33yLH5BDgaA4vcRK3qwY6")
-DERIV_API_TOKEN = os.environ.get("DERIV_API_TOKEN", "pat_dd504873355fa2fa3b84ea9765daa345944464973b330cc6d34dac25e162458a")  # REQUIRED for live trading
+DERIV_APP_ID = os.environ.get("DERIV_APP_ID", "1089")
+DERIV_API_TOKEN = os.environ.get("DERIV_API_TOKEN", "")  # REQUIRED for live trading
+DERIV_ACCOUNT_ID = os.environ.get("DERIV_ACCOUNT_ID", "")  # optional; auto-resolved if unset
+DERIV_USE_REAL_ACCOUNT = os.environ.get("DERIV_USE_REAL", "false").lower() in ("1", "true", "yes")
+
+# Legacy direct-connect endpoint. Kept only as a fallback for accounts that
+# haven't been migrated to Deriv's new Options API yet (see deriv_client.py
+# docstring) — DerivClient tries the new REST+OTP flow first and only falls
+# back to this if that flow's own account-lookup step comes back 404.
 DERIV_WS_URL = f"wss://ws.derivws.com/websockets/v3?app_id={DERIV_APP_ID}"
 
-SUPABASE_URL = os.environ.get("SUPABASE_URL", "https://ybxbbfunyddvuwibgbse.supabase.co")
-SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InlieGJiZnVueWRkdnV3aWJnYnNlIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc3OTY3MTc0NSwiZXhwIjoyMDk1MjQ3NzQ1fQ.Ubur1jpVYgyzf69NpwDHbTV4ukx_u4YPLUNF1ZHlwzY")
+# New Options API — REST bootstrap (Get accounts -> OTP) that produces a
+# short-lived, pre-authenticated WebSocket URL. See:
+# https://developers.deriv.com/docs/options/websocket/
+DERIV_REST_BASE = "https://api.derivws.com"
+
+if DERIV_APP_ID == "1089":
+    import logging as _logging
+    _logging.getLogger("config").warning(
+        "DERIV_APP_ID is unset and defaulting to the shared test app_id '1089'. This is fine for "
+        "quick local testing but Deriv increasingly rate-limits/blocks it for unattended, always-on "
+        "server workloads (like a Railway-hosted bot) — if you see the WS handshake itself being "
+        "rejected with HTTP 401/403, register your own app_id at https://api.deriv.com/ (Apps > "
+        "Register application) and set DERIV_APP_ID in Railway's Variables tab."
+    )
+
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
 
 # ---------------------------------------------------------------------------
 # Symbols

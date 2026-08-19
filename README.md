@@ -107,6 +107,68 @@ One thing worth doing before your first live deploy: run `python test_core.py`
 locally (or as a one-off Railway command) so you're not debugging both the
 statistics *and* the deployment at the same time.
 
+## Connecting to Deriv: the Options API migration
+
+Deriv has moved accounts off the old "connect directly, then send an
+`authorize` message" WebSocket flow onto a REST-bootstrapped flow ("Options
+API" — see https://developers.deriv.com/docs/options/websocket/):
+
+1. `GET /trading/v1/options/accounts` (Bearer token) → pick a demo/real
+   `account_id`.
+2. `POST /trading/v1/options/accounts/{id}/otp` (Bearer token) → a
+   short-lived (120s), single-use WebSocket URL with an OTP embedded.
+3. Connect to that URL directly — no `authorize` message needed. Everything
+   else (`ticks`, `proposal`, `buy`, `proposal_open_contract`, ...) is the
+   same message protocol as before.
+
+`deriv_client.py`'s `connect()` tries this flow first, and falls back to the
+old direct-connect flow only if the account-lookup step 404s (meaning this
+token genuinely has no Options-API accounts — not yet migrated). If your
+account has been migrated, connecting straight to the old
+`wss://ws.derivws.com/websockets/v3?app_id=...` endpoint gets the WebSocket
+handshake itself rejected with **HTTP 401** — before Deriv even reads an
+`authorize` message — which looks identical to a bad token or a blocked
+app_id/IP in the traceback, but isn't either of those. This was the root
+cause the first time this bot hit that error.
+
+Set `DERIV_ACCOUNT_ID` if you want to pin a specific account instead of
+auto-resolving demo/real from `DERIV_USE_REAL` (default: demo).
+
+## Troubleshooting: `websockets.exceptions.InvalidStatus: server rejected WebSocket connection: HTTP 401`
+
+If the container crashes immediately on boot with this traceback (pointing at
+`deriv_client.py`'s `connect()`, *before* `authorize()` is ever called), the
+WebSocket **handshake itself** was refused — this is not a bad
+`DERIV_API_TOKEN` (a bad token fails later, inside `authorize()`, with a
+Deriv `error` payload, not an HTTP 401 on connect). In rough order of
+likelihood:
+
+1. **`DERIV_APP_ID` is unset and defaulting to the shared test id `1089`.**
+   It's fine for a quick local script, but Deriv increasingly
+   rate-limits/blocks it for unattended, always-on server workloads. Register
+   your own app at https://api.deriv.com/ (Apps → Register application) and
+   set `DERIV_APP_ID` in Railway's Variables tab.
+2. **Deriv is rejecting the connection based on IP, not app_id/token.**
+   Railway egresses from datacenter IP ranges, and Deriv's terms restrict
+   VPN/proxy/datacenter access for compliance reasons — this can 401 at the
+   network edge no matter how correct your app_id/token are. To tell this
+   apart from (1): run the bot (or just `test_core.py`'s equivalent — a bare
+   `ws_connect` to the same URL) from a residential connection, e.g. your own
+   laptop, with the same `DERIV_APP_ID`. If it works there and fails only on
+   Railway, it's the host IP, not the config — you'd need a residential
+   proxy/different host, or to run it somewhere Deriv doesn't flag.
+3. **Rate-limiting from repeated reconnects.** Especially relevant if the
+   process crash-loops (Railway's `ON_FAILURE` restart policy will hammer
+   the same endpoint every few seconds) — each crash-restart is a fresh
+   handshake attempt, which can itself trip rate limits and turn a transient
+   issue into a longer block.
+
+As of this version, `main.py` no longer lets an HTTP 401/403 on connect crash
+straight through to a Railway restart loop: it catches `DerivConnectError`,
+logs the specific status/headers/body Deriv returned, and backs off (30s,
+60s, 90s) for up to 3 consecutive permanent rejections before giving up with
+a clear message, instead of retrying every few seconds indefinitely.
+
 ## Known gaps / next steps
 
 - `deriv_client.py` is written against Deriv's documented WebSocket API v3

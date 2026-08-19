@@ -16,13 +16,14 @@ Run: DERIV_API_TOKEN=... SUPABASE_URL=... SUPABASE_KEY=... python main.py
 """
 import asyncio
 import logging
+import random
 
 import config
 import ev_engine
 import markov_entropy as me
 import monte_carlo as mc
 import probability_engine as pe
-from deriv_client import DerivClient
+from deriv_client import DerivClient, DerivConnectError
 from digit_utils import DigitBuffer, extract_last_digit
 from payout_cache import PayoutCache
 from persistence import Persistence
@@ -169,11 +170,50 @@ class DigitBot:
 
 
 async def main():
-    bot = DigitBot()
-    try:
-        await bot.start()
-    finally:
-        await bot.client.close()
+    # Reconnect loop with exponential backoff + jitter, run at this level (rather
+    # than relying on Railway's ON_FAILURE process restart) so that:
+    #  - transient network blips don't kill the whole container and burn through
+    #    railway.json's restartPolicyMaxRetries budget in seconds flat, and
+    #  - a *permanent* rejection (HTTP 401/403 on the WS handshake itself, e.g.
+    #    bad/blocked app_id) fails fast with a clear message instead of hot-looping
+    #    against Deriv's edge, which risks turning a config problem into an IP-level
+    #    block.
+    attempt = 0
+    max_permanent_failures = 3
+    permanent_failures = 0
+    while True:
+        attempt += 1
+        bot = DigitBot()
+        try:
+            await bot.start()
+            return  # start() only returns on a clean, deliberate shutdown
+        except DerivConnectError as e:
+            if e.permanent:
+                permanent_failures += 1
+                log.error(
+                    "Deriv connection permanently rejected (attempt %d, %d/%d before giving up): %s",
+                    attempt, permanent_failures, max_permanent_failures, e,
+                )
+                if permanent_failures >= max_permanent_failures:
+                    log.error(
+                        "Giving up after %d consecutive permanent connection rejections. This is a "
+                        "config/network issue, not something a restart will fix — see the guidance "
+                        "logged above (register your own DERIV_APP_ID, check whether this host's IP "
+                        "is being blocked as datacenter/VPN traffic) before redeploying.",
+                        permanent_failures,
+                    )
+                    raise
+                delay = 30 * permanent_failures  # slow, deliberate backoff for auth-type failures
+            else:
+                delay = min(60, 2 ** min(attempt, 6)) + random.uniform(0, 1)
+                log.warning("Deriv connection failed (attempt %d): %s — retrying in %.1fs", attempt, e, delay)
+            await asyncio.sleep(delay)
+        except Exception:
+            delay = min(60, 2 ** min(attempt, 6)) + random.uniform(0, 1)
+            log.exception("Unexpected error in bot.start() (attempt %d) — retrying in %.1fs", attempt, delay)
+            await asyncio.sleep(delay)
+        finally:
+            await bot.client.close()
 
 
 if __name__ == "__main__":
