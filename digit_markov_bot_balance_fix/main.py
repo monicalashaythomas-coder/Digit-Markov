@@ -17,6 +17,7 @@ Run: DERIV_API_TOKEN=... SUPABASE_URL=... SUPABASE_KEY=... python main.py
 import asyncio
 import logging
 import random
+import sys
 
 import config
 import ev_engine
@@ -29,9 +30,22 @@ from payout_cache import PayoutCache
 from persistence import Persistence
 from risk_manager import RiskManager
 
+# Railway (and most log platforms) classify severity by which stream a line
+# arrives on, not by parsing the level text inside the message. Python's
+# default StreamHandler (no `stream=` arg) writes to stderr, which meant
+# every log line -- INFO, DEBUG, all of it -- was showing up tagged
+# "error" in Railway regardless of actual level. Routing to stdout lets
+# genuine ERROR/CRITICAL lines (which we still want visible) stand out
+# instead of being buried in hundreds of false-positive red lines.
 logging.basicConfig(level=getattr(logging, config.LOG_LEVEL, logging.INFO),
-                     format="%(asctime)s %(name)s %(levelname)s %(message)s")
+                     format="%(asctime)s %(name)s %(levelname)s %(message)s",
+                     stream=sys.stdout)
 log = logging.getLogger("main")
+
+# httpx logs one INFO line per HTTP request (every single Supabase write),
+# which drowns out everything else at scale. Bump it to WARNING so only
+# genuine problems from that library surface.
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 
 class DigitBot:
