@@ -1,0 +1,6 @@
+numpy>=1.26
+scipy>=1.11
+# >=13.0 required for websockets.asyncio.client (the new, non-legacy
+# implementation this bot targets explicitly — see deriv_client.py).
+websockets>=13.0
+supabase>=2.3.0
