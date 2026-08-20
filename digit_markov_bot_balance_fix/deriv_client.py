@@ -107,6 +107,10 @@ class DerivClient:
         self._contract_settled_handler: Optional[CONTRACT_SETTLED_HANDLER] = None
         self._listener_task: Optional[asyncio.Task] = None
         self.balance: float = 0.0
+        # Tracks fire-and-forget tasks spawned from _dispatch() (see _spawn)
+        # so they aren't garbage-collected mid-flight, and so any exception
+        # they raise gets logged instead of silently disappearing.
+        self._background_tasks: set = set()
         # Set by _listen() the moment the read loop exits for ANY reason
         # (clean close, ConnectionClosed, or unexpected exception). start()
         # awaits this instead of a never-set asyncio.Event(), so a dropped
@@ -293,19 +297,49 @@ class DerivClient:
             return
 
         if msg_type == "tick" and self._tick_handler:
+            # CRITICAL: spawned as a background task, NOT awaited inline.
+            # _dispatch() runs inside _listen()'s `async for raw in self.ws`
+            # loop -- the ONLY place that reads incoming websocket messages.
+            # on_tick() can end up calling get_proposal_full()/buy_contract(),
+            # which await a response future that can only be resolved by
+            # THIS SAME read loop processing the next message. Awaiting the
+            # tick handler inline here means the read loop blocks on a call
+            # that can only complete once the read loop runs again --
+            # a guaranteed deadlock, 100% of the time, for every proposal or
+            # buy request triggered from a tick. This was the actual cause
+            # of every "Deriv API request timed out" seen in production so
+            # far; PayoutCache's probes were unaffected only because they
+            # run in their own independent task, outside this call stack.
             tick = msg["tick"]
             symbol = tick["symbol"]
             price = float(tick["quote"])
             pip_size = self._pip_size.get(symbol, 4)
-            await self._tick_handler(symbol, price, pip_size)
+            self._spawn(self._tick_handler(symbol, price, pip_size))
 
         elif msg_type == "proposal_open_contract" and self._contract_settled_handler:
             poc = msg["proposal_open_contract"]
             if poc.get("is_sold") or poc.get("status") in ("won", "lost"):
-                await self._contract_settled_handler(poc)
+                self._spawn(self._contract_settled_handler(poc))
 
         elif msg_type == "balance":
             self.balance = float(msg["balance"]["balance"])
+
+    def _spawn(self, coro) -> asyncio.Task:
+        """Fire-and-forget a coroutine off the read loop, keeping a strong
+        reference so it can't be garbage-collected mid-flight, and logging
+        (rather than silently swallowing) any exception it raises."""
+        task = asyncio.create_task(coro)
+        self._background_tasks.add(task)
+        task.add_done_callback(self._on_background_task_done)
+        return task
+
+    def _on_background_task_done(self, task: asyncio.Task):
+        self._background_tasks.discard(task)
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            log.error("Unhandled exception in background handler task", exc_info=exc)
 
     # ------------------------------------------------------------------
     # Request/response helper

@@ -57,6 +57,15 @@ class DigitBot:
         self.payout_cache: PayoutCache = None
         self._open_contracts = {}  # contract_id -> (symbol, stake)
         self._tick_counts = {sym: 0 for sym in config.SYMBOLS}  # drives heartbeat/snapshot throttling
+        # Ticks are now processed concurrently (deriv_client._dispatch spawns
+        # on_tick as a background task instead of blocking its own read loop
+        # on it -- see deriv_client.py for why that blocking was a deadlock).
+        # That means two ticks for the SAME symbol can now overlap: without
+        # a guard, both could pass risk_manager.can_trade() before either's
+        # open_positions increment lands, and both attempt to execute. This
+        # lock serializes evaluation/execution per symbol while still
+        # letting different symbols run fully concurrently.
+        self._symbol_locks = {sym: asyncio.Lock() for sym in config.SYMBOLS}
 
     async def start(self):
         await self.client.connect()
@@ -118,10 +127,20 @@ class DigitBot:
         digits = buf.as_list()
         log_snapshot = (tick_n % config.DECISION_LOG_EVERY_N_TICKS == 0)
 
-        try:
-            await self.evaluate_and_maybe_trade(symbol, digits, log_snapshot)
-        except Exception:
-            log.exception("Error evaluating %s", symbol)
+        lock = self._symbol_locks[symbol]
+        if lock.locked():
+            # A trade attempt for this symbol (e.g. awaiting a live proposal
+            # or buy confirmation) is still in flight -- skip evaluating
+            # this tick rather than stacking a second concurrent attempt on
+            # top of it. digits keep accumulating in buf regardless; the
+            # next free tick just evaluates against a slightly larger window.
+            return
+
+        async with lock:
+            try:
+                await self.evaluate_and_maybe_trade(symbol, digits, log_snapshot)
+            except Exception:
+                log.exception("Error evaluating %s", symbol)
 
     # ------------------------------------------------------------------
     async def evaluate_and_maybe_trade(self, symbol: str, digits: list, log_snapshot: bool = False):
