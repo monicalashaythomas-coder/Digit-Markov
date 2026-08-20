@@ -107,6 +107,17 @@ class DerivClient:
         self._contract_settled_handler: Optional[CONTRACT_SETTLED_HANDLER] = None
         self._listener_task: Optional[asyncio.Task] = None
         self.balance: float = 0.0
+        # Tracks fire-and-forget tasks spawned from _dispatch() (see _spawn)
+        # so they aren't garbage-collected mid-flight, and so any exception
+        # they raise gets logged instead of silently disappearing.
+        self._background_tasks: set = set()
+        # Set by _listen() the moment the read loop exits for ANY reason
+        # (clean close, ConnectionClosed, or unexpected exception). start()
+        # awaits this instead of a never-set asyncio.Event(), so a dropped
+        # connection actually surfaces as a failure main()'s reconnect loop
+        # can see and act on, instead of leaving the process running forever
+        # with a dead socket and no subscriptions.
+        self.disconnected = asyncio.Event()
 
     # ------------------------------------------------------------------
     # Connection lifecycle
@@ -232,7 +243,10 @@ class DerivClient:
 
         if self._authenticated_via_otp:
             # OTP already authenticated this connection to the account — no
-            # `authorize` message needed, just subscribe to balance updates.
+            # `authorize` message needed, but we still need the balance
+            # fetched explicitly (see get_balance() docstring) before
+            # subscribing to future push updates.
+            await self.get_balance()
             await self._send({"balance": 1, "subscribe": 1})
         else:
             await self.authorize()
@@ -249,10 +263,25 @@ class DerivClient:
             async for raw in self.ws:
                 msg = json.loads(raw)
                 await self._dispatch(msg)
+            # The `async for` loop above exits on a CLEAN close too (server
+            # ends the stream without raising) -- that's still a disconnect
+            # the bot needs to react to, so it's handled by the shared
+            # `finally` below rather than only the ConnectionClosed branch.
         except asyncio.CancelledError:
-            pass
+            pass  # deliberate shutdown (bot.client.close()) — not a disconnect to recover from
         except ConnectionClosed:
             log.error("Deriv websocket connection closed unexpectedly.")
+        finally:
+            # Whatever the reason the read loop stopped, nobody can receive
+            # more ticks or proposal/buy responses on this socket anymore.
+            # Any request still awaiting a response in _pending would
+            # otherwise hang until its own 15s timeout for no good reason —
+            # fail them immediately with a clear cause instead.
+            for fut in self._pending.values():
+                if not fut.done():
+                    fut.set_exception(ConnectionClosed(None, None))
+            self._pending.clear()
+            self.disconnected.set()
 
     async def _dispatch(self, msg: dict):
         req_id = msg.get("req_id")
@@ -268,19 +297,49 @@ class DerivClient:
             return
 
         if msg_type == "tick" and self._tick_handler:
+            # CRITICAL: spawned as a background task, NOT awaited inline.
+            # _dispatch() runs inside _listen()'s `async for raw in self.ws`
+            # loop -- the ONLY place that reads incoming websocket messages.
+            # on_tick() can end up calling get_proposal_full()/buy_contract(),
+            # which await a response future that can only be resolved by
+            # THIS SAME read loop processing the next message. Awaiting the
+            # tick handler inline here means the read loop blocks on a call
+            # that can only complete once the read loop runs again --
+            # a guaranteed deadlock, 100% of the time, for every proposal or
+            # buy request triggered from a tick. This was the actual cause
+            # of every "Deriv API request timed out" seen in production so
+            # far; PayoutCache's probes were unaffected only because they
+            # run in their own independent task, outside this call stack.
             tick = msg["tick"]
             symbol = tick["symbol"]
             price = float(tick["quote"])
             pip_size = self._pip_size.get(symbol, 4)
-            await self._tick_handler(symbol, price, pip_size)
+            self._spawn(self._tick_handler(symbol, price, pip_size))
 
         elif msg_type == "proposal_open_contract" and self._contract_settled_handler:
             poc = msg["proposal_open_contract"]
             if poc.get("is_sold") or poc.get("status") in ("won", "lost"):
-                await self._contract_settled_handler(poc)
+                self._spawn(self._contract_settled_handler(poc))
 
         elif msg_type == "balance":
             self.balance = float(msg["balance"]["balance"])
+
+    def _spawn(self, coro) -> asyncio.Task:
+        """Fire-and-forget a coroutine off the read loop, keeping a strong
+        reference so it can't be garbage-collected mid-flight, and logging
+        (rather than silently swallowing) any exception it raises."""
+        task = asyncio.create_task(coro)
+        self._background_tasks.add(task)
+        task.add_done_callback(self._on_background_task_done)
+        return task
+
+    def _on_background_task_done(self, task: asyncio.Task):
+        self._background_tasks.discard(task)
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            log.error("Unhandled exception in background handler task", exc_info=exc)
 
     # ------------------------------------------------------------------
     # Request/response helper
@@ -304,8 +363,26 @@ class DerivClient:
         resp = await self._send({"authorize": self.api_token})
         if resp.get("error"):
             raise RuntimeError(f"Authorization failed: {resp['error']}")
+        await self.get_balance()
         await self._send({"balance": 1, "subscribe": 1})
         return resp["authorize"]
+
+    async def get_balance(self) -> float:
+        """
+        One-shot balance fetch. Unlike the {"balance":1,"subscribe":1} call,
+        this response is captured directly from its own awaited future rather
+        than relying on the fire-and-forget subscribe response (which
+        _dispatch() resolves straight to a pending future and never falls
+        through to the `elif msg_type == "balance"` push handler — so that
+        value was previously discarded and self.balance stayed at its 0.0
+        default until an unrelated future push happened to update it, which
+        for a bot that can't stake $0 to trigger one, was never).
+        """
+        resp = await self._send({"balance": 1})
+        if resp.get("error"):
+            raise RuntimeError(f"Balance fetch failed: {resp['error']}")
+        self.balance = float(resp["balance"]["balance"])
+        return self.balance
 
     async def get_active_symbol_pip_size(self, symbol: str) -> int:
         if symbol in self._pip_size:

@@ -17,6 +17,7 @@ Run: DERIV_API_TOKEN=... SUPABASE_URL=... SUPABASE_KEY=... python main.py
 import asyncio
 import logging
 import random
+import sys
 
 import config
 import ev_engine
@@ -29,9 +30,22 @@ from payout_cache import PayoutCache
 from persistence import Persistence
 from risk_manager import RiskManager
 
+# Railway (and most log platforms) classify severity by which stream a line
+# arrives on, not by parsing the level text inside the message. Python's
+# default StreamHandler (no `stream=` arg) writes to stderr, which meant
+# every log line -- INFO, DEBUG, all of it -- was showing up tagged
+# "error" in Railway regardless of actual level. Routing to stdout lets
+# genuine ERROR/CRITICAL lines (which we still want visible) stand out
+# instead of being buried in hundreds of false-positive red lines.
 logging.basicConfig(level=getattr(logging, config.LOG_LEVEL, logging.INFO),
-                     format="%(asctime)s %(name)s %(levelname)s %(message)s")
+                     format="%(asctime)s %(name)s %(levelname)s %(message)s",
+                     stream=sys.stdout)
 log = logging.getLogger("main")
+
+# httpx logs one INFO line per HTTP request (every single Supabase write),
+# which drowns out everything else at scale. Bump it to WARNING so only
+# genuine problems from that library surface.
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 
 class DigitBot:
@@ -42,15 +56,28 @@ class DigitBot:
         self.risk_manager: RiskManager = None  # set after balance known
         self.payout_cache: PayoutCache = None
         self._open_contracts = {}  # contract_id -> (symbol, stake)
+        self._tick_counts = {sym: 0 for sym in config.SYMBOLS}  # drives heartbeat/snapshot throttling
+        # Ticks are now processed concurrently (deriv_client._dispatch spawns
+        # on_tick as a background task instead of blocking its own read loop
+        # on it -- see deriv_client.py for why that blocking was a deadlock).
+        # That means two ticks for the SAME symbol can now overlap: without
+        # a guard, both could pass risk_manager.can_trade() before either's
+        # open_positions increment lands, and both attempt to execute. This
+        # lock serializes evaluation/execution per symbol while still
+        # letting different symbols run fully concurrently.
+        self._symbol_locks = {sym: asyncio.Lock() for sym in config.SYMBOLS}
 
     async def start(self):
         await self.client.connect()
-        # balance arrives via subscription; give it a moment then default if unavailable
-        await asyncio.sleep(1.0)
+        # connect() now awaits an explicit get_balance() call internally, so
+        # self.client.balance is the real account balance by the time we get
+        # here — no arbitrary sleep needed.
         starting_balance = self.client.balance or 0.0
         if starting_balance <= 0:
-            log.warning("Could not read account balance — defaulting risk sizing to $0 base; "
-                        "verify DERIV_API_TOKEN before relying on this bot.")
+            log.error("Account balance reads as $0 (or unavailable) after connect() — "
+                       "refusing to start live trading with a broken/empty balance. "
+                       "Verify DERIV_API_TOKEN and account funding before retrying.")
+            raise SystemExit(1)
         self.risk_manager = RiskManager(starting_balance=starting_balance)
 
         self.payout_cache = PayoutCache(self.client, config.SYMBOLS)
@@ -65,7 +92,16 @@ class DigitBot:
         log.info("Subscribed to %d symbols. Warmup requires %d digits before trading begins.",
                   len(config.SYMBOLS), config.MIN_DIGITS_FOR_WARMUP)
 
-        await asyncio.Event().wait()  # run forever
+        # Block here until the connection actually drops -- NOT a fresh,
+        # never-set asyncio.Event(). Previously this awaited an Event()
+        # nobody ever .set(), so a dead websocket left the process running
+        # forever with no subscriptions and no way for main()'s reconnect
+        # loop to notice (that loop only reacts to exceptions raised out of
+        # start(), and nothing was raising). Now: when the client detects
+        # disconnect, we wake up and raise, which main() already knows how
+        # to handle with backoff.
+        await self.client.disconnected.wait()
+        raise DerivConnectError("Deriv websocket connection lost mid-session", permanent=False)
 
     # ------------------------------------------------------------------
     async def on_tick(self, symbol: str, price: float, pip_size: int):
@@ -73,32 +109,76 @@ class DigitBot:
         buf = self.buffers[symbol]
         buf.push(digit)
 
+        self._tick_counts[symbol] += 1
+        tick_n = self._tick_counts[symbol]
+
         if not buf.is_warm(config.MIN_DIGITS_FOR_WARMUP):
+            # Proof-of-life during warmup — without this, a symbol that's
+            # legitimately still buffering looks identical in the logs to one
+            # whose tick subscription silently died.
+            if tick_n % config.WARMUP_HEARTBEAT_EVERY_N_TICKS == 0 or len(buf) == 1:
+                log.info("WARMUP %-8s %4d/%-4d digits buffered (price=%s last_digit=%d)",
+                          symbol, len(buf), config.MIN_DIGITS_FOR_WARMUP, price, digit)
             return
 
-        digits = buf.as_list()
+        if len(buf) == config.MIN_DIGITS_FOR_WARMUP:
+            log.info("%-8s warmup complete — beginning evaluation.", symbol)
 
-        try:
-            await self.evaluate_and_maybe_trade(symbol, digits)
-        except Exception:
-            log.exception("Error evaluating %s", symbol)
+        digits = buf.as_list()
+        log_snapshot = (tick_n % config.DECISION_LOG_EVERY_N_TICKS == 0)
+
+        lock = self._symbol_locks[symbol]
+        if lock.locked():
+            # A trade attempt for this symbol (e.g. awaiting a live proposal
+            # or buy confirmation) is still in flight -- skip evaluating
+            # this tick rather than stacking a second concurrent attempt on
+            # top of it. digits keep accumulating in buf regardless; the
+            # next free tick just evaluates against a slightly larger window.
+            return
+
+        async with lock:
+            try:
+                await self.evaluate_and_maybe_trade(symbol, digits, log_snapshot)
+            except Exception:
+                log.exception("Error evaluating %s", symbol)
 
     # ------------------------------------------------------------------
-    async def evaluate_and_maybe_trade(self, symbol: str, digits: list):
+    async def evaluate_and_maybe_trade(self, symbol: str, digits: list, log_snapshot: bool = False):
         estimates = pe.estimate_all_horizons(digits)
-        rep = next(iter(estimates.values())).significance  # same battery for all horizons
+        est0 = next(iter(estimates.values()))
+        rep = est0.significance  # same battery for all horizons
 
         self.persistence.log_feature_snapshot(
-            symbol, len(digits), rep, me.normalized_entropy(digits),
-            next(iter(estimates.values())).model_weight,
+            symbol, len(digits), rep, est0.entropy_normalized, est0.model_weight,
         )
+
+        if log_snapshot:
+            # This is the "what are the indicators saying, what are the
+            # thresholds" line. Printed every DECISION_LOG_EVERY_N_TICKS
+            # ticks (not every tick) so it stays readable at scale, but it
+            # fires regardless of whether anything is actionable -- that's
+            # the point, so "no edge" is visibly a decision, not silence.
+            log.info(
+                "SCAN %-8s n=%d | chi2 p=%.4f<%.2f=%s | runs p=%.4f<%.2f=%s | "
+                "ac1=%+.4f sig=%s | fired=%d/%d req=%d | actionable=%s | "
+                "weight=%.3f/%.2f | entropy=%.3f",
+                symbol, len(digits),
+                rep.chi_square_p, config.CHI_SQUARE_ALPHA, rep.chi_square_significant,
+                rep.runs_p, config.RUNS_TEST_ALPHA, rep.runs_significant,
+                rep.autocorr_lag1, rep.autocorr_significant,
+                rep.n_significant_tests, 3, config.MIN_SIGNIFICANT_TESTS,
+                rep.is_actionable,
+                est0.model_weight, config.MAX_MODEL_WEIGHT, est0.entropy_normalized,
+            )
 
         if not rep.is_actionable:
             return  # honest "no edge" — do nothing, this is the expected common case
 
         can_trade, reason = self.risk_manager.can_trade(symbol)
         if not can_trade:
-            log.debug("Skipping %s: %s", symbol, reason)
+            # rep.is_actionable is already the rare case, so a risk-gate
+            # block on top of that is worth seeing at INFO, not buried at DEBUG.
+            log.info("ACTIONABLE %s but blocked by risk_manager: %s", symbol, reason)
             return
 
         transition_counts = me.build_transition_counts_order1(digits)
@@ -112,33 +192,51 @@ class DigitBot:
 
         ranked = ev_engine.rank_candidates(all_candidates)
         if not ranked:
+            log.info("%-8s actionable but 0 candidates — payout_cache likely has no live "
+                      "quotes yet for this symbol/horizon set.", symbol)
             return
 
+        # rank_candidates no longer filters by edge/EV — it just sorts. The
+        # top-ranked candidate here may still have negative edge if every
+        # candidate this cycle does; execute_trade (via risk_manager's Kelly
+        # floor) is what actually decides whether real money goes on it.
         best = ranked[0]
+        log.info("%-8s %d candidates, best by edge: %s barrier=%s h=%d edge=%.4f ev=%.4f prob_lcb=%.4f",
+                  symbol, len(ranked), best.contract_type, best.barrier, best.horizon,
+                  best.edge, best.ev_per_unit_stake, best.prob_lcb)
         await self.execute_trade(best)
 
     # ------------------------------------------------------------------
     async def execute_trade(self, candidate: ev_engine.TradeCandidate):
         stake = self.risk_manager.stake_for_candidate(candidate)
         if stake <= 0:
+            log.info("%-8s %s h=%d barrier=%s: raw Kelly <= 0 (prob_lcb=%.4f vs breakeven) "
+                      "-- edge is negative at the conservative bound, not staking.",
+                      candidate.symbol, candidate.contract_type, candidate.horizon,
+                      candidate.barrier, candidate.prob_lcb)
             return
 
         proposal = await self.client.get_proposal_full(
             candidate.symbol, candidate.contract_type, candidate.horizon, candidate.barrier, stake
         )
         if not proposal:
-            log.debug("No live proposal available for %s %s", candidate.symbol, candidate.contract_type)
+            log.info("%-8s %s: no live proposal available, skipping.",
+                      candidate.symbol, candidate.contract_type)
             return
 
         # Re-check EV against the FRESH payout before committing real money —
         # the cached payout used for ranking can drift between refresh cycles.
         fresh_payout_pct = (float(proposal["payout"]) - stake) / stake
         if fresh_payout_pct < config.MIN_PAYOUT_PCT:
+            log.info("%-8s %s: fresh payout %.2f%% below MIN_PAYOUT_PCT %.2f%%, skipping.",
+                      candidate.symbol, candidate.contract_type,
+                      fresh_payout_pct * 100, config.MIN_PAYOUT_PCT * 100)
             return
         fresh_edge = candidate.prob_lcb - ev_engine.breakeven_prob(fresh_payout_pct)
         if fresh_edge < config.MIN_EDGE:
-            log.debug("Fresh payout invalidated edge for %s %s — skipping.",
-                      candidate.symbol, candidate.contract_type)
+            log.info("%-8s %s: fresh edge %.4f < MIN_EDGE %.4f (payout drifted since ranking) "
+                      "-- skipping.", candidate.symbol, candidate.contract_type,
+                      fresh_edge, config.MIN_EDGE)
             return
 
         buy = await self.client.buy_contract(proposal["id"], float(proposal["ask_price"]))
