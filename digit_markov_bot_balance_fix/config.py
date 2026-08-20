@@ -82,7 +82,7 @@ RUNS_TEST_ALPHA = 0.01
 # edge, a lone false-positive test has a real (if modest) chance of
 # producing a candidate risk_manager will actually stake on. Revisit this
 # once live/demo results come in.
-MIN_SIGNIFICANT_TESTS = 3
+MIN_SIGNIFICANT_TESTS = 1
 
 # Z-score threshold for a single digit to be considered "hot"/"cold"
 DIGIT_ZSCORE_THRESHOLD = 2.58  # ~99% CI
