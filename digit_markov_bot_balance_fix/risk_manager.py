@@ -83,13 +83,25 @@ class RiskManager:
             f* = (b*p - q) / b   where b = payout_pct, p = win prob, q = 1-p
         We use the LOWER-confidence-bound probability (already embedded in
         candidate.prob_lcb) so sizing is conservative by construction.
+
+        Returns 0.0 when raw Kelly is non-positive -- i.e. prob_lcb doesn't
+        clear the breakeven probability implied by the payout at all. This
+        matters more than usual now that ev_engine.rank_candidates no longer
+        filters on edge: without this check, EVERY actionable window would
+        stake base_stake_fraction regardless of which side of breakeven
+        prob_lcb actually falls on, which has nothing to do with the p(next
+        digit) model being right or wrong -- it's just staking the floor on
+        a coin the payout structure has already priced against you.
         """
         b = candidate.payout_pct
         p = candidate.prob_lcb
         q = 1 - p
-        kelly = (b * p - q) / b if b > 0 else 0.0
-        kelly = max(0.0, kelly) * self.cfg.kelly_fraction_cap
+        raw_kelly = (b * p - q) / b if b > 0 else 0.0
 
+        if raw_kelly <= 0:
+            return 0.0
+
+        kelly = raw_kelly * self.cfg.kelly_fraction_cap
         fraction = max(self.cfg.base_stake_fraction, kelly)
         fraction = min(fraction, self.cfg.max_stake_fraction)
         return round(fraction * self.state.balance, 2)

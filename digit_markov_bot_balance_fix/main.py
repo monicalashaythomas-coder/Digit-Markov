@@ -56,6 +56,7 @@ class DigitBot:
         self.risk_manager: RiskManager = None  # set after balance known
         self.payout_cache: PayoutCache = None
         self._open_contracts = {}  # contract_id -> (symbol, stake)
+        self._tick_counts = {sym: 0 for sym in config.SYMBOLS}  # drives heartbeat/snapshot throttling
 
     async def start(self):
         await self.client.connect()
@@ -90,32 +91,66 @@ class DigitBot:
         buf = self.buffers[symbol]
         buf.push(digit)
 
+        self._tick_counts[symbol] += 1
+        tick_n = self._tick_counts[symbol]
+
         if not buf.is_warm(config.MIN_DIGITS_FOR_WARMUP):
+            # Proof-of-life during warmup — without this, a symbol that's
+            # legitimately still buffering looks identical in the logs to one
+            # whose tick subscription silently died.
+            if tick_n % config.WARMUP_HEARTBEAT_EVERY_N_TICKS == 0 or len(buf) == 1:
+                log.info("WARMUP %-8s %4d/%-4d digits buffered (price=%s last_digit=%d)",
+                          symbol, len(buf), config.MIN_DIGITS_FOR_WARMUP, price, digit)
             return
 
+        if len(buf) == config.MIN_DIGITS_FOR_WARMUP:
+            log.info("%-8s warmup complete — beginning evaluation.", symbol)
+
         digits = buf.as_list()
+        log_snapshot = (tick_n % config.DECISION_LOG_EVERY_N_TICKS == 0)
 
         try:
-            await self.evaluate_and_maybe_trade(symbol, digits)
+            await self.evaluate_and_maybe_trade(symbol, digits, log_snapshot)
         except Exception:
             log.exception("Error evaluating %s", symbol)
 
     # ------------------------------------------------------------------
-    async def evaluate_and_maybe_trade(self, symbol: str, digits: list):
+    async def evaluate_and_maybe_trade(self, symbol: str, digits: list, log_snapshot: bool = False):
         estimates = pe.estimate_all_horizons(digits)
-        rep = next(iter(estimates.values())).significance  # same battery for all horizons
+        est0 = next(iter(estimates.values()))
+        rep = est0.significance  # same battery for all horizons
 
         self.persistence.log_feature_snapshot(
-            symbol, len(digits), rep, me.normalized_entropy(digits),
-            next(iter(estimates.values())).model_weight,
+            symbol, len(digits), rep, est0.entropy_normalized, est0.model_weight,
         )
+
+        if log_snapshot:
+            # This is the "what are the indicators saying, what are the
+            # thresholds" line. Printed every DECISION_LOG_EVERY_N_TICKS
+            # ticks (not every tick) so it stays readable at scale, but it
+            # fires regardless of whether anything is actionable -- that's
+            # the point, so "no edge" is visibly a decision, not silence.
+            log.info(
+                "SCAN %-8s n=%d | chi2 p=%.4f<%.2f=%s | runs p=%.4f<%.2f=%s | "
+                "ac1=%+.4f sig=%s | fired=%d/%d req=%d | actionable=%s | "
+                "weight=%.3f/%.2f | entropy=%.3f",
+                symbol, len(digits),
+                rep.chi_square_p, config.CHI_SQUARE_ALPHA, rep.chi_square_significant,
+                rep.runs_p, config.RUNS_TEST_ALPHA, rep.runs_significant,
+                rep.autocorr_lag1, rep.autocorr_significant,
+                rep.n_significant_tests, 3, config.MIN_SIGNIFICANT_TESTS,
+                rep.is_actionable,
+                est0.model_weight, config.MAX_MODEL_WEIGHT, est0.entropy_normalized,
+            )
 
         if not rep.is_actionable:
             return  # honest "no edge" — do nothing, this is the expected common case
 
         can_trade, reason = self.risk_manager.can_trade(symbol)
         if not can_trade:
-            log.debug("Skipping %s: %s", symbol, reason)
+            # rep.is_actionable is already the rare case, so a risk-gate
+            # block on top of that is worth seeing at INFO, not buried at DEBUG.
+            log.info("ACTIONABLE %s but blocked by risk_manager: %s", symbol, reason)
             return
 
         transition_counts = me.build_transition_counts_order1(digits)
@@ -129,33 +164,51 @@ class DigitBot:
 
         ranked = ev_engine.rank_candidates(all_candidates)
         if not ranked:
+            log.info("%-8s actionable but 0 candidates — payout_cache likely has no live "
+                      "quotes yet for this symbol/horizon set.", symbol)
             return
 
+        # rank_candidates no longer filters by edge/EV — it just sorts. The
+        # top-ranked candidate here may still have negative edge if every
+        # candidate this cycle does; execute_trade (via risk_manager's Kelly
+        # floor) is what actually decides whether real money goes on it.
         best = ranked[0]
+        log.info("%-8s %d candidates, best by edge: %s barrier=%s h=%d edge=%.4f ev=%.4f prob_lcb=%.4f",
+                  symbol, len(ranked), best.contract_type, best.barrier, best.horizon,
+                  best.edge, best.ev_per_unit_stake, best.prob_lcb)
         await self.execute_trade(best)
 
     # ------------------------------------------------------------------
     async def execute_trade(self, candidate: ev_engine.TradeCandidate):
         stake = self.risk_manager.stake_for_candidate(candidate)
         if stake <= 0:
+            log.info("%-8s %s h=%d barrier=%s: raw Kelly <= 0 (prob_lcb=%.4f vs breakeven) "
+                      "-- edge is negative at the conservative bound, not staking.",
+                      candidate.symbol, candidate.contract_type, candidate.horizon,
+                      candidate.barrier, candidate.prob_lcb)
             return
 
         proposal = await self.client.get_proposal_full(
             candidate.symbol, candidate.contract_type, candidate.horizon, candidate.barrier, stake
         )
         if not proposal:
-            log.debug("No live proposal available for %s %s", candidate.symbol, candidate.contract_type)
+            log.info("%-8s %s: no live proposal available, skipping.",
+                      candidate.symbol, candidate.contract_type)
             return
 
         # Re-check EV against the FRESH payout before committing real money —
         # the cached payout used for ranking can drift between refresh cycles.
         fresh_payout_pct = (float(proposal["payout"]) - stake) / stake
         if fresh_payout_pct < config.MIN_PAYOUT_PCT:
+            log.info("%-8s %s: fresh payout %.2f%% below MIN_PAYOUT_PCT %.2f%%, skipping.",
+                      candidate.symbol, candidate.contract_type,
+                      fresh_payout_pct * 100, config.MIN_PAYOUT_PCT * 100)
             return
         fresh_edge = candidate.prob_lcb - ev_engine.breakeven_prob(fresh_payout_pct)
         if fresh_edge < config.MIN_EDGE:
-            log.debug("Fresh payout invalidated edge for %s %s — skipping.",
-                      candidate.symbol, candidate.contract_type)
+            log.info("%-8s %s: fresh edge %.4f < MIN_EDGE %.4f (payout drifted since ranking) "
+                      "-- skipping.", candidate.symbol, candidate.contract_type,
+                      fresh_edge, config.MIN_EDGE)
             return
 
         buy = await self.client.buy_contract(proposal["id"], float(proposal["ask_price"]))

@@ -89,9 +89,16 @@ MC_SEED = None  # set an int for reproducibility during testing
 # ---------------------------------------------------------------------------
 # EV / trade gating
 # ---------------------------------------------------------------------------
-# Minimum edge (model probability - breakeven probability implied by payout)
-# required to trade at all, in absolute probability terms.
-MIN_EDGE = 0.02
+# Minimum edge (model probability - breakeven probability implied by payout).
+# NOTE: as of this change, this is NO LONGER enforced in ev_engine.rank_candidates
+# (that filter was removed on purpose so actionable windows trade regardless
+# of edge size, to collect live data). It's still enforced once, in
+# main.execute_trade, as a final check against the FRESH payout right before
+# buying — i.e. it now only protects against payout drift between ranking
+# and execution, not against low-edge trades in general. Lowered from 0.02
+# pending re-tightening once live results come in. Override with MIN_EDGE
+# env var for fast iteration without a redeploy-edit cycle.
+MIN_EDGE = float(os.environ.get("MIN_EDGE", "0.005"))
 # Minimum payout ratio (matches expiryrange_compression_bot's threshold) —
 # don't trade contracts Deriv is only offering thin payouts on.
 MIN_PAYOUT_PCT = 0.52
@@ -121,3 +128,17 @@ RISK = RiskConfig()
 # ---------------------------------------------------------------------------
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO")
 FEATURE_LOG_EVERY_N_TICKS = 1  # log every tick's features (cheap, valuable for walk-forward eval)
+
+# How often (in ticks, per symbol) to emit an INFO heartbeat while a symbol
+# is still buffering toward MIN_DIGITS_FOR_WARMUP. Exists so "the bot looks
+# silent" during the ~5 minute warmup window has a concrete answer (ticks
+# ARE arriving, here's the count) instead of dead air.
+WARMUP_HEARTBEAT_EVERY_N_TICKS = int(os.environ.get("WARMUP_HEARTBEAT_EVERY_N_TICKS", "50"))
+
+# How often (in ticks, per symbol) to emit a full decision-level snapshot at
+# INFO once warmed up — chi2/runs/autocorr stats vs their thresholds, model
+# weight, entropy. The significance battery reruns every tick regardless
+# (it's cheap); this only throttles how often it's PRINTED, since digit
+# streams are uniform ~99% of the time and printing every tick would drown
+# real signal in noise.
+DECISION_LOG_EVERY_N_TICKS = int(os.environ.get("DECISION_LOG_EVERY_N_TICKS", "20"))

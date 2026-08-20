@@ -109,13 +109,21 @@ def evaluate_even_odd(
 
 def rank_candidates(candidates: List[TradeCandidate]) -> List[TradeCandidate]:
     """
-    Filter to statistically-significant, EV-positive-past-margin candidates,
-    ranked best edge first. This is the single gate that decides whether the
-    bot trades Over/Under or Even/Odd on a given symbol/horizon — "whichever
-    has better EV signal at the time".
+    Ranks ALL candidates by edge, best first — NO minimum-edge / positive-EV
+    filter here anymore (removed deliberately, per explicit instruction, to
+    let trades through for live data collection while MIN_EDGE gets tuned).
+
+    This means a candidate with negative edge CAN be returned as "best" if
+    every candidate for this symbol/horizon batch is negative-edge. Two
+    things still stand between that and money actually being spent on it:
+      1. risk_manager.stake_for_candidate floors stake to 0 for non-positive
+         Kelly, so execute_trade's `if stake <= 0: return` skips it.
+      2. execute_trade still enforces config.MIN_EDGE against the FRESH
+         payout right before buying (see main.py) — that check was left in
+         place as the one real backstop and was only loosened, not removed.
+    If you want candidates ranked in a way that's more useful once you're
+    tuning MIN_EDGE back up from real data, consider filtering on
+    `c.ev_per_unit_stake > 0` alone (drop the edge threshold only) as a
+    middle ground — currently this returns everything, unfiltered.
     """
-    eligible = [
-        c for c in candidates
-        if c.significant and c.edge >= config.MIN_EDGE and c.ev_per_unit_stake > 0
-    ]
-    return sorted(eligible, key=lambda c: c.edge, reverse=True)
+    return sorted(candidates, key=lambda c: c.edge, reverse=True)
