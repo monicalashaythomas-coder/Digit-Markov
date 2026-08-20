@@ -45,8 +45,8 @@ SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
 # Symbols
 # ---------------------------------------------------------------------------
 SYMBOLS: List[str] = [
-    "1HZ10V",
-    "1HZ25V",
+    "R_10",
+    "R_75",
     "1HZ50V",
     "1HZ75V",
     "1HZ100V",
@@ -58,7 +58,7 @@ DIGIT_WINDOW = 1000
 MIN_DIGITS_FOR_WARMUP = 300
 
 # Horizons (ticks ahead) the probability engine estimates
-HORIZONS = (2, 5)
+HORIZONS = (1, 5)
 
 # ---------------------------------------------------------------------------
 # Statistical significance gating
@@ -82,7 +82,7 @@ RUNS_TEST_ALPHA = 0.01
 # edge, a lone false-positive test has a real (if modest) chance of
 # producing a candidate risk_manager will actually stake on. Revisit this
 # once live/demo results come in.
-MIN_SIGNIFICANT_TESTS = 2
+MIN_SIGNIFICANT_TESTS = 3
 
 # Z-score threshold for a single digit to be considered "hot"/"cold"
 DIGIT_ZSCORE_THRESHOLD = 2.58  # ~99% CI
@@ -115,8 +115,8 @@ MIN_EDGE = float(os.environ.get("MIN_EDGE", "0.005"))
 # don't trade contracts Deriv is only offering thin payouts on.
 MIN_PAYOUT_PCT = 0.52
 
-OVER_BARRIERS = [2, 3,]   # DIGITOVER candidates: digit > barrier
-UNDER_BARRIERS = [7, 8]  # DIGITUNDER candidates: digit < barrier
+OVER_BARRIERS = [2,]   # DIGITOVER candidates: digit > barrier
+UNDER_BARRIERS = [7,]  # DIGITUNDER candidates: digit < barrier
 
 # ---------------------------------------------------------------------------
 # Risk management (LIVE from the start — keep this tight)
