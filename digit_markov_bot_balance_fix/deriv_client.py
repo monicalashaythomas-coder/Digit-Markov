@@ -107,6 +107,13 @@ class DerivClient:
         self._contract_settled_handler: Optional[CONTRACT_SETTLED_HANDLER] = None
         self._listener_task: Optional[asyncio.Task] = None
         self.balance: float = 0.0
+        # Set by _listen() the moment the read loop exits for ANY reason
+        # (clean close, ConnectionClosed, or unexpected exception). start()
+        # awaits this instead of a never-set asyncio.Event(), so a dropped
+        # connection actually surfaces as a failure main()'s reconnect loop
+        # can see and act on, instead of leaving the process running forever
+        # with a dead socket and no subscriptions.
+        self.disconnected = asyncio.Event()
 
     # ------------------------------------------------------------------
     # Connection lifecycle
@@ -252,10 +259,25 @@ class DerivClient:
             async for raw in self.ws:
                 msg = json.loads(raw)
                 await self._dispatch(msg)
+            # The `async for` loop above exits on a CLEAN close too (server
+            # ends the stream without raising) -- that's still a disconnect
+            # the bot needs to react to, so it's handled by the shared
+            # `finally` below rather than only the ConnectionClosed branch.
         except asyncio.CancelledError:
-            pass
+            pass  # deliberate shutdown (bot.client.close()) — not a disconnect to recover from
         except ConnectionClosed:
             log.error("Deriv websocket connection closed unexpectedly.")
+        finally:
+            # Whatever the reason the read loop stopped, nobody can receive
+            # more ticks or proposal/buy responses on this socket anymore.
+            # Any request still awaiting a response in _pending would
+            # otherwise hang until its own 15s timeout for no good reason —
+            # fail them immediately with a clear cause instead.
+            for fut in self._pending.values():
+                if not fut.done():
+                    fut.set_exception(ConnectionClosed(None, None))
+            self._pending.clear()
+            self.disconnected.set()
 
     async def _dispatch(self, msg: dict):
         req_id = msg.get("req_id")

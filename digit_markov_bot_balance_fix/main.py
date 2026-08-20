@@ -83,7 +83,16 @@ class DigitBot:
         log.info("Subscribed to %d symbols. Warmup requires %d digits before trading begins.",
                   len(config.SYMBOLS), config.MIN_DIGITS_FOR_WARMUP)
 
-        await asyncio.Event().wait()  # run forever
+        # Block here until the connection actually drops -- NOT a fresh,
+        # never-set asyncio.Event(). Previously this awaited an Event()
+        # nobody ever .set(), so a dead websocket left the process running
+        # forever with no subscriptions and no way for main()'s reconnect
+        # loop to notice (that loop only reacts to exceptions raised out of
+        # start(), and nothing was raising). Now: when the client detects
+        # disconnect, we wake up and raise, which main() already knows how
+        # to handle with backoff.
+        await self.client.disconnected.wait()
+        raise DerivConnectError("Deriv websocket connection lost mid-session", permanent=False)
 
     # ------------------------------------------------------------------
     async def on_tick(self, symbol: str, price: float, pip_size: int):
