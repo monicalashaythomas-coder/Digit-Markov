@@ -115,7 +115,8 @@ MIN_EDGE = float(os.environ.get("MIN_EDGE", "0.005"))
 # don't trade contracts Deriv is only offering thin payouts on.
 MIN_PAYOUT_PCT = 0.52
 
-OVER_UNDER_BARRIERS = [2, 3, 4, 5, 6, 7]  # candidate barrier digits to evaluate
+OVER_BARRIERS = [2, 3, 4, 5]   # DIGITOVER candidates: digit > barrier
+UNDER_BARRIERS = [5, 6, 7, 8]  # DIGITUNDER candidates: digit < barrier
 
 # ---------------------------------------------------------------------------
 # Risk management (LIVE from the start — keep this tight)

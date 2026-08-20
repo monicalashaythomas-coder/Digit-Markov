@@ -39,8 +39,9 @@ class PayoutCache:
         for symbol in self.symbols:
             for horizon in config.HORIZONS:
                 combos = [("DIGITEVEN", None), ("DIGITODD", None)]
-                for barrier in config.OVER_UNDER_BARRIERS:
+                for barrier in config.OVER_BARRIERS:
                     combos.append(("DIGITOVER", barrier))
+                for barrier in config.UNDER_BARRIERS:
                     combos.append(("DIGITUNDER", barrier))
 
                 for contract_type, barrier in combos:

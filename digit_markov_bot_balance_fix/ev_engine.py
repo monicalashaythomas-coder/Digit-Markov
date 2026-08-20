@@ -55,27 +55,47 @@ def evaluate_over_under(
 ) -> List[TradeCandidate]:
     candidates = []
     digit_mask = np.arange(10)
-    for barrier in config.OVER_UNDER_BARRIERS:
-        for contract_type, mask in (
-            ("DIGITOVER", digit_mask > barrier),
-            ("DIGITUNDER", digit_mask < barrier),
-        ):
-            point = float(mc.digit_probs[mask].sum())
-            se = mc.prob_se_for_mask(mask)
-            lcb = _lcb(point, se)
+    # OVER and UNDER now use independent barrier ranges (config.OVER_BARRIERS /
+    # config.UNDER_BARRIERS) rather than one shared list applied to both --
+    # e.g. OVER 2-5 (moderate-to-wide win prob) and UNDER 5-8 (wide win prob,
+    # thinner payout), per explicit instruction.
+    for barrier in config.OVER_BARRIERS:
+        mask = digit_mask > barrier
+        point = float(mc.digit_probs[mask].sum())
+        se = mc.prob_se_for_mask(mask)
+        lcb = _lcb(point, se)
 
-            payout_pct = payout_lookup(symbol, contract_type, horizon, barrier)
-            if payout_pct is None or payout_pct < config.MIN_PAYOUT_PCT:
-                continue
+        payout_pct = payout_lookup(symbol, "DIGITOVER", horizon, barrier)
+        if payout_pct is None or payout_pct < config.MIN_PAYOUT_PCT:
+            continue
 
-            edge = lcb - breakeven_prob(payout_pct)
-            ev = ev_per_unit_stake(lcb, payout_pct)
+        edge = lcb - breakeven_prob(payout_pct)
+        ev = ev_per_unit_stake(lcb, payout_pct)
 
-            candidates.append(TradeCandidate(
-                symbol=symbol, horizon=horizon, contract_type=contract_type, barrier=barrier,
-                prob_point=point, prob_lcb=lcb, payout_pct=payout_pct,
-                ev_per_unit_stake=ev, edge=edge, significant=significant,
-            ))
+        candidates.append(TradeCandidate(
+            symbol=symbol, horizon=horizon, contract_type="DIGITOVER", barrier=barrier,
+            prob_point=point, prob_lcb=lcb, payout_pct=payout_pct,
+            ev_per_unit_stake=ev, edge=edge, significant=significant,
+        ))
+
+    for barrier in config.UNDER_BARRIERS:
+        mask = digit_mask < barrier
+        point = float(mc.digit_probs[mask].sum())
+        se = mc.prob_se_for_mask(mask)
+        lcb = _lcb(point, se)
+
+        payout_pct = payout_lookup(symbol, "DIGITUNDER", horizon, barrier)
+        if payout_pct is None or payout_pct < config.MIN_PAYOUT_PCT:
+            continue
+
+        edge = lcb - breakeven_prob(payout_pct)
+        ev = ev_per_unit_stake(lcb, payout_pct)
+
+        candidates.append(TradeCandidate(
+            symbol=symbol, horizon=horizon, contract_type="DIGITUNDER", barrier=barrier,
+            prob_point=point, prob_lcb=lcb, payout_pct=payout_pct,
+            ev_per_unit_stake=ev, edge=edge, significant=significant,
+        ))
     return candidates
 
 
