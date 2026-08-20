@@ -70,7 +70,19 @@ HORIZONS = (1, 2, 5)
 # breaks down, not to hallucinate edges out of noise every tick.
 CHI_SQUARE_ALPHA = 0.01        # reject uniformity only at strong significance
 RUNS_TEST_ALPHA = 0.01
-MIN_SIGNIFICANT_TESTS = 2      # how many of {chi2, runs, autocorr} must fire
+# How many of {chi2, runs, autocorr} must independently cross their alpha
+# threshold before a window is trusted over the uniform prior.
+# Lowered from 2 -> 1 per explicit instruction (2026-08-20). Understand what
+# this trades away: with all three tests at alpha=0.01 and roughly
+# independent, P(>=2 of 3 fire on pure noise) ~ 0.03%, vs P(>=1 fires on
+# pure noise) ~ 3% -- about a 100x higher false-positive rate. Each single-
+# test trigger still gets a small model_weight via the corroboration term
+# in probability_engine._model_weight_from_significance (n_sig/3 = 1/3), but
+# with MIN_EDGE now at 0.005 and rank_candidates no longer filtering by
+# edge, a lone false-positive test has a real (if modest) chance of
+# producing a candidate risk_manager will actually stake on. Revisit this
+# once live/demo results come in.
+MIN_SIGNIFICANT_TESTS = 1
 
 # Z-score threshold for a single digit to be considered "hot"/"cold"
 DIGIT_ZSCORE_THRESHOLD = 2.58  # ~99% CI
